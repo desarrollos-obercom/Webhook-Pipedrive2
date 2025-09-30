@@ -1038,6 +1038,11 @@ if ($httpCode == 200) {
     // ==========================
     // CONSULTAR CLIENTE RECIÉN CREADO
     // ==========================
+$maxAttempts = 5;
+$attempt = 0;
+$clienteData = null;
+
+while ($attempt < $maxAttempts) {
     $consultaPayload = [
         "action" => "cliente",
         "libre"  => $person['name'] // o $numerodocumento si preferís más exactitud
@@ -1060,54 +1065,67 @@ if ($httpCode == 200) {
     $httpCodeConsulta = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
-    logDebug("Respuesta consulta cliente: " . $responseConsulta);
+    logDebug("Intento #" . ($attempt + 1) . " - Respuesta consulta cliente: " . $responseConsulta);
 
     $clienteData = json_decode($responseConsulta, true);
 
     if ($httpCodeConsulta == 200 && isset($clienteData['cliente_id'])) {
         $clienteId = $clienteData['cliente_id'];
+        logDebug("✅ Cliente encontrado con ID: $clienteId");
+        break;
+    }
 
-        // ==========================
-        // CREAR CASO
-        // ==========================
-        $descripcion = base64_encode("Caso creado automáticamente desde Pipedrive");
+    $attempt++;
+    sleep(2); // Esperar 2 segundos antes del siguiente intento
+}
 
-        $casoPayload = [
-            "action"      => "genera_reclamo",
-            "cliente_id"  => $clienteId,
-            "creado_por"  => "Webhook",
-            "via"         => "WhatsApp",
-            "descripcion" => $descripcion
-        ];
+if (!isset($clienteId)) {
+    echo json_encode([
+        "status"  => "error",
+        "message" => "No se pudo obtener cliente_id después de la creación",
+        "response"=> $clienteData
+    ]);
+    exit;
+}
 
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-        curl_setopt($ch, CURLOPT_USERPWD, "$usuario:$contrasena");
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($casoPayload));
-        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Content-Type: application/json'
-        ]);
+// ==========================
+// CREAR CASO
+// ==========================
+$descripcion = base64_encode("Caso creado automáticamente desde Pipedrive");
 
-        $responseCaso = curl_exec($ch);
-        $httpCodeCaso = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
+$casoPayload = [
+    "action"      => "genera_reclamo",
+    "cliente_id"  => $clienteId,
+    "creado_por"  => "Webhook",
+    "via"         => "WhatsApp",
+    "descripcion" => $descripcion
+];
 
-        logDebug("Respuesta crear caso: " . $responseCaso);
+// Código cURL para crear el caso (igual que antes)
+$ch = curl_init($url);
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+curl_setopt($ch, CURLOPT_USERPWD, "$usuario:$contrasena");
+curl_setopt($ch, CURLOPT_POST, true);
+curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($casoPayload));
+curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+$responseCaso = curl_exec($ch);
+$httpCodeCaso = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+curl_close($ch);
 
-        $casoData = json_decode($responseCaso, true);
+logDebug("Respuesta crear caso: " . $responseCaso);
+$casoData = json_decode($responseCaso, true);
 
-        echo json_encode([
-            "status"    => "success",
-            "http_code" => $httpCode,
-            "request"   => $payload,
-            "cliente"   => $clienteData,
-            "caso"      => $casoData
-        ]);
+echo json_encode([
+    "status"    => "success",
+    "http_code" => $httpCode,
+    "request"   => $payload,
+    "cliente"   => $clienteData,
+    "caso"      => $casoData
+]);
 
     } else {
         echo json_encode([
@@ -1127,4 +1145,5 @@ if ($httpCode == 200) {
     ]);
     logDebug("❌ Error en la solicitud a GestionReal");
 }
+
 ?>
