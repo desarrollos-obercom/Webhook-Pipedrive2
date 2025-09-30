@@ -1119,15 +1119,16 @@ curl_close($ch);
 logDebug("Respuesta crear caso: " . $responseCaso);
 $casoData = json_decode($responseCaso, true);
 
-echo json_encode([
-    "status"    => "success",
-    "http_code" => $httpCode,
-    "request"   => $payload,
-    "cliente"   => $clienteData,
-    "caso"      => $casoData
-]);
+        echo json_encode([
+            "status"    => "success",
+            "http_code" => $httpCode,
+            "request"   => $payload,
+            "cliente"   => $clienteData,
+            "caso"      => $casoData
+        ]);
 
     } else {
+        // ===== Error si no encontró cliente_id =====
         echo json_encode([
             "status"  => "error",
             "message" => "No se pudo obtener cliente_id después de la creación",
@@ -1136,6 +1137,7 @@ echo json_encode([
     }
 
 } else {
+    // ===== Error si no creó cliente =====
     echo json_encode([
         "status"    => "error",
         "http_code" => $httpCode,
@@ -1146,4 +1148,6 @@ echo json_encode([
     logDebug("❌ Error en la solicitud a GestionReal");
 }
 
+
 ?>
+
