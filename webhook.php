@@ -1068,9 +1068,9 @@ if ($httpCode == 200) {
 
     if ($httpCodeBuscar == 200) {
         $clienteData = json_decode($buscarResponse, true);
-        if (isset($clienteData['data'][0]['cliente_id'])) {
-            $cliente_id = $clienteData['data'][0]['cliente_id'];
-            logDebug("Cliente encontrado con ID: $cliente_id");
+        if (isset($clienteData['clientes'][0]['idcustomer'])) {
+    $cliente_id = $clienteData['clientes'][0]['idcustomer'];
+    logDebug("Cliente encontrado con ID: $cliente_id");
 
             // ==========================
             // CREAR CASO EN GESTIONREAL
