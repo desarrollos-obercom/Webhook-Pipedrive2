@@ -1082,7 +1082,7 @@ if ($httpCode == 200) {
                 "cliente_id"  => $cliente_id,
                 "creado_por"  => "Web",
                 "via"         => "Interno",
-                "descripcion" => $descripcionCaso
+                "descripcion" => $descripcionCaso,
                 "tipo_caso_id" => 2,  // fijo
                 "grupo_id"     => 369  // fijo
             ];
@@ -1123,3 +1123,4 @@ if ($httpCode == 200) {
 }
 
 ?>
+
