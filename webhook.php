@@ -1033,7 +1033,7 @@ header("Content-Type: application/json");
 
 if ($httpCode == 200) {
     $responseData = json_decode($response, true);
-    $clienteNombre = $payload['nombre'];
+    $clienteNombre = trim($payload['nombre']);
 
     logDebug("Cliente creado en GestionReal: $clienteNombre. Esperando 5 segundos antes de buscarlo...");
     sleep(5); // Delay de 5 segundos
@@ -1042,8 +1042,9 @@ if ($httpCode == 200) {
     // CONSULTAR CLIENTE RECIÉN CREADO EN GESTIONREAL
     // ==========================
     $buscarPayload = [
-        "action" => "cliente",
-        "libre"  => $clienteNombre
+        "action"         => "cliente",
+        "tipo_documento" => $tipoDocId,
+        "nro_documento"  => $numerodocumento
     ];
 
     $ch = curl_init($url);
@@ -1057,7 +1058,7 @@ if ($httpCode == 200) {
     curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
     curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
 
-    logDebug("Buscando cliente en GestionReal por nombre...");
+    logDebug("Buscando cliente en GestionReal por tipo_documento + nro_documento...");
     $buscarResponse = curl_exec($ch);
     $httpCodeBuscar = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $errorBuscar = curl_error($ch);
@@ -1117,6 +1118,6 @@ if ($httpCode == 200) {
         "response"  => $responseData
     ]);
     logDebug("✅ Solicitud exitosa a GestionReal");
-} 
+}
 
 ?>
