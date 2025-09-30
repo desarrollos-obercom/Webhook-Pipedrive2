@@ -1075,14 +1075,16 @@ if ($httpCode == 200) {
             // ==========================
             // CREAR CASO EN GESTIONREAL
             // ==========================
-            $descripcionCaso = base64_encode("Caso automático creado para el cliente $clienteNombre");
+            $descripcionCaso = base64_encode("Caso generado por Pipedrive para el cliente $clienteNombre");
 
             $casoPayload = [
                 "action"      => "genera_reclamo",
                 "cliente_id"  => $cliente_id,
                 "creado_por"  => "Web",
-                "via"         => "WhatsApp",
+                "via"         => "Interno",
                 "descripcion" => $descripcionCaso
+                "tipo_caso_id" => 2,  // fijo
+                "grupo_id"     => 369  // fijo
             ];
 
             $ch = curl_init($url);
