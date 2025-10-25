@@ -7,6 +7,195 @@ $SECRET = "OBER@MIS@2025";   // Reemplazar con el secret real
 $PIPEDRIVE_API_KEY = "199d22fb1c8959644dcdc8daa8b86bb9ded48e1f";
 
 // ==========================
+// CONFIGURACIÓN TELEGRAM BOT
+// ==========================
+$TELEGRAM_BOT_TOKEN = "8475255816:AAENgqsBXajJJsrqgaBKR0Nh14rUtFrtjpo";
+$TELEGRAM_CHAT_IDS = [
+    "-1002743538492"   // Nuevo chat ID 2
+];
+
+// ==========================
+// MEJORA CRÍTICA: RESPONDER INMEDIATAMENTE A PIPEDRIVE
+// ==========================
+
+// 1. INICIAR BUFFER DE SALIDA Y ENVIAR CABECERAS INMEDIATAMENTE
+ob_start();
+header("Content-Type: application/json");
+http_response_code(200);
+
+// 2. RESPONDER A PIPEDRIVE DE INMEDIATO PARA EVITAR REINTENTOS
+echo json_encode(["status" => "processing", "message" => "Webhook received and processing"]);
+header('Content-Length: ' . ob_get_length());
+ob_end_flush();
+flush();
+
+// 3. CONTINUAR PROCESAMIENTO EN SEGUNDO PLANO
+if (function_exists('fastcgi_finish_request')) {
+    fastcgi_finish_request();
+}
+
+// ==========================
+// SISTEMA DE BLOQUEO PARA EVITAR EJECUCIONES PARALELAS DEL MISMO DEAL
+// ==========================
+
+// PRIMERO: Obtener el ID del deal inmediatamente para el lock específico
+$input = file_get_contents("php://input");
+$data  = json_decode($input, true);
+
+// Obtener el ID del deal
+if (isset($data["trato"]) && is_numeric($data["trato"])) {
+    $deal_id = $data["trato"];
+} elseif (isset($data["deal"]) && is_numeric($data["deal"])) {
+    $deal_id = $data["deal"];
+} elseif (isset($data["current"]) && isset($data["current"]["id"])) {
+    $deal_id = $data["current"]["id"];
+} else {
+    $errorMsg = "ID de deal no proporcionado en formato esperado.";
+    error_log("ERROR: " . $errorMsg);
+    exit;
+}
+
+// Lock global para evitar ejecuciones paralelas del webhook en general
+$lockFile = sys_get_temp_dir() . '/pipedrive_webhook.lock';
+$lockHandle = fopen($lockFile, 'w+');
+
+if (!$lockHandle) {
+    error_log("No se pudo crear archivo de lock global");
+    exit;
+}
+
+// Intentar obtener lock exclusivo (timeout corto solo para paralelismo)
+$lockObtained = false;
+$attempts = 0;
+while ($attempts < 3) {
+    if (flock($lockHandle, LOCK_EX | LOCK_NB)) {
+        $lockObtained = true;
+        break;
+    }
+    usleep(100000); // 100ms
+    $attempts++;
+}
+
+if (!$lockObtained) {
+    fclose($lockHandle);
+    error_log("Webhook bloqueado - ya hay una ejecución en curso");
+    exit;
+}
+
+// Registrar que tenemos el lock global
+ftruncate($lockHandle, 0);
+fwrite($lockHandle, "Locked by PID: " . getmypid() . " at " . date('Y-m-d H:i:s'));
+fflush($lockHandle);
+
+// SEGUNDO: Lock específico por DEAL para evitar duplicados del mismo deal
+$dealLockFile = sys_get_temp_dir() . '/pipedrive_deal_' . $deal_id . '.lock';
+$dealLockHandle = fopen($dealLockFile, 'w+');
+
+if (!$dealLockHandle) {
+    error_log("No se pudo crear archivo de lock para deal $deal_id");
+    // Liberar lock global antes de salir
+    flock($lockHandle, LOCK_UN);
+    fclose($lockHandle);
+    exit;
+}
+
+// Intentar obtener lock exclusivo para ESTE DEAL específico
+$dealLockObtained = false;
+$attempts = 0;
+while ($attempts < 3) {
+    if (flock($dealLockHandle, LOCK_EX | LOCK_NB)) {
+        $dealLockObtained = true;
+        break;
+    }
+    usleep(100000); // 100ms
+    $attempts++;
+}
+
+if (!$dealLockObtained) {
+    fclose($dealLockHandle);
+    // Liberar lock global antes de salir
+    flock($lockHandle, LOCK_UN);
+    fclose($lockHandle);
+    error_log("🚫 Deal $deal_id ya está siendo procesado - omitiendo ejecución duplicada");
+    exit; // ← ESTO ES CLAVE: Sale completamente sin procesar nada
+}
+
+// Registrar que tenemos el lock para este deal
+ftruncate($dealLockHandle, 0);
+fwrite($dealLockHandle, "Locked by PID: " . getmypid() . " at " . date('Y-m-d H:i:s'));
+fflush($dealLockHandle);
+
+// ==========================
+// SISTEMA DE CONTROL DE MENSAJES TELEGRAM - EVITA DUPLICADOS
+// ==========================
+$telegramMessageLog = sys_get_temp_dir() . '/telegram_messages.log';
+$messageTimeout = 300; // 5 minutos
+
+function canSendTelegramMessage($deal_id, $messageType) {
+    global $telegramMessageLog, $messageTimeout;
+    
+    $sentMessages = [];
+    
+    // Leer mensajes enviados recientemente
+    if (file_exists($telegramMessageLog)) {
+        $content = file_get_contents($telegramMessageLog);
+        $lines = explode("\n", $content);
+        foreach ($lines as $line) {
+            if (trim($line)) {
+                list($saved_deal_id, $saved_type, $timestamp) = explode('|', $line);
+                // Solo considerar mensajes que no hayan expirado
+                if (time() - $timestamp < $messageTimeout) {
+                    if (!isset($sentMessages[$saved_deal_id])) {
+                        $sentMessages[$saved_deal_id] = [];
+                    }
+                    $sentMessages[$saved_deal_id][$saved_type] = $timestamp;
+                }
+            }
+        }
+    }
+    
+    // Verificar si ya enviamos un mensaje de este tipo para este deal recientemente
+    if (isset($sentMessages[$deal_id][$messageType])) {
+        error_log("Mensaje $messageType para deal $deal_id ya fue enviado hace " . 
+                 (time() - $sentMessages[$deal_id][$messageType]) . " segundos - omitiendo");
+        return false;
+    }
+    
+    return true;
+}
+
+function markTelegramMessageSent($deal_id, $messageType) {
+    global $telegramMessageLog;
+    
+    $sentMessages = [];
+    
+    // Leer mensajes existentes
+    if (file_exists($telegramMessageLog)) {
+        $content = file_get_contents($telegramMessageLog);
+        $lines = explode("\n", $content);
+        foreach ($lines as $line) {
+            if (trim($line)) {
+                list($saved_deal_id, $saved_type, $timestamp) = explode('|', $line);
+                $sentMessages[] = "$saved_deal_id|$saved_type|$timestamp";
+            }
+        }
+    }
+    
+    // Agregar nuevo mensaje
+    $sentMessages[] = "$deal_id|$messageType|" . time();
+    
+    // Mantener solo los últimos 200 registros
+    if (count($sentMessages) > 200) {
+        $sentMessages = array_slice($sentMessages, -200, 200);
+    }
+    
+    // Guardar archivo actualizado
+    file_put_contents($telegramMessageLog, implode("\n", $sentMessages));
+    
+    error_log("✅ Mensaje $messageType para deal $deal_id registrado como enviado");
+}
+
+// ==========================
 // MAPEO DE TIPO DE DOCUMENTO
 // ==========================
 $tipoDocumentoMap = [
@@ -707,7 +896,7 @@ $estadoMap = [
 // MAPEO DE CONDICIONES DE VENTA
 // ==========================
 $condVentaMap = [
-    "615" => "Cuenta corriente",
+    "615" => "Cuenta Corriente",
 ];
 
 // ==========================
@@ -726,7 +915,249 @@ $corporativoMap = [
 ];
 
 // ==========================
-// FUNCIONES AUXILIARES
+// MAPEO DE BARRIOS
+// ==========================
+$barrioMap = [
+    "692" => 1,
+    "693" => 2,
+    "694" => 3,
+    "695" => 4,
+    "696" => 5,
+    "697" => 6,
+    "698" => 7,
+    "699" => 8,
+    "700" => 9,
+    "701" => 10,
+    "702" => 11,
+    "703" => 12,
+    "704" => 13,
+    "705" => 14,
+    "706" => 15,
+    "707" => 16,
+    "708" => 17,
+    "709" => 18,
+    "710" => 19,
+    "711" => 20,
+    "712" => 21,
+    "713" => 22,
+    "714" => 23,
+    "715" => 24,
+    "716" => 25,
+    "717" => 26,
+    "718" => 27,
+    "719" => 28,
+    "720" => 29,
+    "721" => 30,
+    "722" => 31,
+    "723" => 32,
+    "724" => 33,
+    "725" => 34,
+    "726" => 35,
+    "727" => 36,
+    "728" => 37,
+    "729" => 38,
+    "730" => 39,
+    "731" => 40,
+    "732" => 41,
+    "733" => 42,
+    "734" => 43,
+    "735" => 44,
+    "736" => 45,
+    "737" => 46,
+    "738" => 47,
+    "739" => 48,
+    "740" => 49,
+    "741" => 50,
+    "742" => 51,
+    "743" => 52,
+    "744" => 53,
+    "745" => 54,
+    "746" => 55,
+    "747" => 56,
+    "748" => 57,
+    "749" => 58,
+    "750" => 59,
+    "751" => 60,
+    "752" => 61,
+    "753" => 62,
+    "754" => 63,
+    "755" => 64,
+    "756" => 65,
+    "757" => 66,
+    "758" => 67,
+    "759" => 68,
+    "760" => 69,
+    "761" => 70,
+    "762" => 71,
+    "763" => 72,
+    "764" => 73,
+    "765" => 74,
+    "766" => 75,
+    "767" => 76,
+    "768" => 77,
+    "769" => 78,
+    "770" => 79,
+    "771" => 80,
+    "772" => 81,
+    "773" => 82,
+    "774" => 83,
+    "775" => 84,
+    "776" => 85,
+    "777" => 86,
+    "778" => 87,
+    "779" => 88,
+    "780" => 89,
+    "781" => 90,
+    "782" => 91,
+    "783" => 92,
+    "784" => 93,
+    "785" => 94,
+    "786" => 95,
+    "787" => 96,
+    "788" => 97,
+    "789" => 98,
+    "790" => 99,
+    "791" => 100,
+    "792" => 101,
+    "793" => 102,
+    "794" => 103,
+    "795" => 104,
+    "796" => 105,
+    "797" => 106,
+    "798" => 107,
+    "799" => 108,
+    "800" => 109,
+    "801" => 110,
+    "802" => 111,
+    "803" => 112,
+    "804" => 113,
+    "805" => 114,
+    "806" => 115,
+    "807" => 116,
+    "808" => 117,
+    "809" => 118,
+    "810" => 119,
+    "811" => 120,
+    "812" => 121,
+    "813" => 122,
+    "814" => 123,
+    "815" => 124,
+    "816" => 125,
+    "817" => 126,
+    "818" => 127,
+    "819" => 128,
+    "820" => 129,
+    "821" => 130,
+    "822" => 131,
+    "823" => 132,
+    "824" => 133,
+    "825" => 134,
+    "826" => 135,
+    "827" => 136,
+    "828" => 137,
+    "829" => 138,
+    "830" => 139,
+    "831" => 140,
+    "832" => 141,
+    "833" => 142,
+    "834" => 143,
+    "835" => 144,
+    "836" => 145,
+    "837" => 146,
+    "838" => 147,
+    "839" => 148,
+    "840" => 149,
+    "841" => 150,
+    "842" => 151,
+    "843" => 152,
+    "844" => 153,
+    "845" => 154,
+    "846" => 155,
+    "847" => 156,
+    "848" => 157,
+    "849" => 158,
+    "850" => 159,
+    "851" => 160,
+    "852" => 161,
+    "853" => 162,
+    "854" => 163,
+    "855" => 164,
+    "856" => 165,
+    "857" => 166,
+    "858" => 167,
+    "859" => 168,
+    "860" => 169,
+    "861" => 170,
+    "862" => 171,
+    "863" => 172,
+    "864" => 173,
+    "865" => 174,
+    "866" => 175,
+    "867" => 176,
+    "868" => 177,
+    "869" => 178,
+    "870" => 179,
+    "871" => 180,
+    "872" => 181,
+    "873" => 182,
+    "874" => 183,
+    "875" => 184,
+    "876" => 185,
+    "877" => 186,
+    "878" => 187,
+    "879" => 188,
+    "880" => 189,
+    "881" => 190,
+    "882" => 191,
+    "883" => 192,
+    "884" => 193,
+    "885" => 194,
+    "886" => 195,
+    "887" => 196,
+    "888" => 197,
+    "889" => 198,
+    "890" => 199,
+    "891" => 200,
+    "892" => 201,
+    "893" => 202,
+    "894" => 203,
+    "895" => 204,
+    "896" => 205,
+    "897" => 206,
+    "898" => 207,
+    "899" => 208,
+    "900" => 209,
+    "901" => 210,
+    "902" => 211,
+    "903" => 212,
+    "904" => 213,
+    "905" => 214,
+    "906" => 215,
+    "907" => 216,
+    "908" => 217,
+    "909" => 218,
+    "910" => 219,
+    "911" => 220,
+    "912" => 221,
+    "913" => 222,
+    "914" => 223,
+    "915" => 224,
+    "916" => 225,
+    "917" => 226,
+    "918" => 227,
+    "919" => 228,
+    "920" => 229,
+    "921" => 230,
+    "922" => 231,
+    "923" => 232,
+    "924" => 233,
+    "925" => 234,
+    "926" => 235,
+    "927" => 236
+];
+
+// ==========================
+// FUNCIONES AUXILIARES MEJORADAS
 // ==========================
 function callPipedriveAPI($endpoint, $api_key) {
     $url = "https://api.pipedrive.com/v1/" . $endpoint . "?api_token=" . $api_key;
@@ -778,349 +1209,543 @@ function logDebug($message) {
 }
 
 // ==========================
-// AUTENTICACIÓN GESTIONREAL
+// FUNCIÓN MEJORADA PARA CAPTURAR ERRORES DE GESTIONREAL
 // ==========================
-$fechaHoy = date("Y-m-d");
-$usuario = $CUIT;
-$tokenBase = $CUIT . $SECRET . $fechaHoy;
-$contrasena = md5($tokenBase);
-
-logDebug("=== AUTENTICACIÓN GESTIONREAL ===");
-logDebug("CUIT: " . $CUIT);
-logDebug("Fecha: " . $fechaHoy);
-logDebug("MD5 generado: " . $contrasena);
-
-// ==========================
-// RECIBIR DATOS DE PIPEDRIVE
-// ==========================
-$input = file_get_contents("php://input");
-$data  = json_decode($input, true);
-
-logDebug("Datos recibidos de Pipedrive: " . json_encode($data));
-
-// Obtener el ID del deal
-if (isset($data["trato"]) && is_numeric($data["trato"])) {
-    $deal_id = $data["trato"];
-} elseif (isset($data["deal"]) && is_numeric($data["deal"])) {
-    $deal_id = $data["deal"];
-} elseif (isset($data["current"]) && isset($data["current"]["id"])) {
-    $deal_id = $data["current"]["id"];
-} else {
-    http_response_code(400);
-    echo json_encode(["error" => "ID de deal no proporcionado en formato esperado."]);
-    logDebug("ERROR: ID de deal no proporcionado. Datos recibidos: " . json_encode($data));
-    exit;
+function callGestionRealAPI($url, $usuario, $contrasena, $payload, $operation = "create") {
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+    curl_setopt($ch, CURLOPT_USERPWD, "$usuario:$contrasena");
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+    
+    // Capturar toda la respuesta completa
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $error = curl_error($ch);
+    curl_close($ch);
+    
+    logDebug("GestionReal API - Operation: $operation - HTTP Code: $httpCode");
+    logDebug("GestionReal Request: " . json_encode($payload));
+    logDebug("GestionReal Response: " . $response);
+    
+    if ($error) {
+        logDebug("GestionReal cURL Error: " . $error);
+    }
+    
+    return [
+        'http_code' => $httpCode,
+        'response' => $response,
+        'error' => $error,
+        'data' => json_decode($response, true)
+    ];
 }
 
-logDebug("Procesando deal ID: " . $deal_id);
-
 // ==========================
-// OBTENER DATOS DEL DEAL
+// FUNCIÓN MEJORADA PARA TELEGRAM - CON MEJOR CAPTURA DE ERRORES
 // ==========================
-$deal_data = callPipedriveAPI("deals/{$deal_id}", $PIPEDRIVE_API_KEY);
-
-if (!$deal_data || !isset($deal_data['data'])) {
-    http_response_code(500);
-    echo json_encode(["error" => "Error al obtener datos del deal de Pipedrive"]);
-    logDebug("ERROR: No se pudo obtener datos del deal");
-    exit;
+function sendTelegramMessage($botToken, $chatIds, $message, $messageType, $deal_id) {
+    // Verificar si ya enviamos este tipo de mensaje para este deal recientemente
+    if (!canSendTelegramMessage($deal_id, $messageType)) {
+        logDebug("⚠️ Mensaje $messageType para deal $deal_id ya fue enviado recientemente - omitiendo");
+        return [];
+    }
+    
+    $results = [];
+    
+    if (!is_array($chatIds)) {
+        $chatIds = [$chatIds];
+    }
+    
+    foreach ($chatIds as $chatId) {
+        $url = "https://api.telegram.org/bot{$botToken}/sendMessage";
+        
+        $data = [
+            'chat_id' => $chatId,
+            'text' => $message,
+            'parse_mode' => 'HTML'
+        ];
+        
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $url);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+        
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        
+        if ($httpCode == 200) {
+            logDebug("✅ Mensaje $messageType enviado a Telegram (Chat ID: $chatId)");
+            $results[$chatId] = true;
+        } else {
+            logDebug("❌ Error enviando mensaje $messageType a Telegram (Chat ID: $chatId) - HTTP Code: $httpCode");
+            $results[$chatId] = false;
+        }
+        
+        usleep(500000);
+    }
+    
+    // Marcar como enviado solo si se envió exitosamente al menos a un chat
+    if (!empty($results) && in_array(true, $results)) {
+        markTelegramMessageSent($deal_id, $messageType);
+    }
+    
+    return $results;
 }
 
-$deal = $deal_data['data'];
-$person_id = $deal['person_id']['value'] ?? null;
-
-if (empty($person_id)) {
-    http_response_code(400);
-    echo json_encode(["error" => "El deal no tiene una persona asociada"]);
-    logDebug("ERROR: Deal sin persona asociada");
-    exit;
+// ==========================
+// FUNCIONES DE FORMATEO MEJORADAS
+// ==========================
+function formatSuccessMessage($nombre, $documento, $clienteId = null, $casoCreado = false) {
+    $message = "✅ <b>REGISTRO EXITOSO</b>\n\n";
+    $message .= "👤 <b>Cliente:</b> " . htmlspecialchars($nombre) . "\n";
+    $message .= "📄 <b>Documento:</b> " . htmlspecialchars($documento) . "\n";
+    if ($clienteId) {
+        $message .= "🆔 <b>ID GestionReal:</b> " . $clienteId . "\n";
+    }
+    if ($casoCreado) {
+        $message .= "📝 <b>Caso creado:</b> Sí\n";
+    }
+    $message .= "⏰ <b>Fecha:</b> " . date('d/m/Y H:i:s') . "\n";
+    $message .= "\nEl cliente se ha procesado correctamente en GestionReal.";
+    
+    return $message;
 }
 
-logDebug("Person ID asociado: " . $person_id);
-
-// ==========================
-// OBTENER DATOS DE LA PERSONA
-// ==========================
-$person_data = callPipedriveAPI("persons/{$person_id}", $PIPEDRIVE_API_KEY);
-
-if (!$person_data || !isset($person_data['data'])) {
-    http_response_code(500);
-    echo json_encode(["error" => "Error al obtener datos de la persona de Pipedrive"]);
-    logDebug("ERROR: No se pudo obtener datos de la persona");
-    exit;
+function formatErrorMessage($nombre, $documento, $errorDescripcion, $httpCode = null, $gestionRealResponse = null) {
+    $message = "❌ <b>ERROR EN REGISTRO</b>\n\n";
+    $message .= "👤 <b>Cliente:</b> " . htmlspecialchars($nombre) . "\n";
+    $message .= "📄 <b>Documento:</b> " . htmlspecialchars($documento) . "\n";
+    if ($httpCode) {
+        $message .= "🔢 <b>Código HTTP:</b> " . $httpCode . "\n";
+    }
+    $message .= "⏰ <b>Fecha:</b> " . date('d/m/Y H:i:s') . "\n";
+    $message .= "\n<b>Detalle del error:</b>\n";
+    $message .= "<code>" . htmlspecialchars($errorDescripcion) . "</code>";
+    
+    // Agregar respuesta completa de GestionReal si está disponible
+    if ($gestionRealResponse) {
+        $message .= "\n\n<b>Respuesta GestionReal:</b>\n";
+        $message .= "<code>" . htmlspecialchars($gestionRealResponse) . "</code>";
+    }
+    
+    return $message;
 }
 
-$person = $person_data['data'];
-logDebug("Persona obtenida: " . $person['name']);
+function formatInfoMessage($nombre, $documento, $clienteId, $casoCreado = false) {
+    $message = "ℹ️ <b>CLIENTE YA EXISTENTE</b>\n\n";
+    $message .= "👤 <b>Cliente:</b> " . htmlspecialchars($nombre) . "\n";
+    $message .= "📄 <b>Documento:</b> " . htmlspecialchars($documento) . "\n";
+    $message .= "🆔 <b>ID GestionReal:</b> " . $clienteId . "\n";
+    if ($casoCreado) {
+        $message .= "📝 <b>Caso creado:</b> Sí\n";
+    }
+    $message .= "⏰ <b>Fecha:</b> " . date('d/m/Y H:i:s') . "\n";
+    $message .= "\nEl cliente ya existía en GestionReal. Se procedió a crear el caso.";
+    
+    return $message;
+}
 
 // ==========================
-// EXTRAER Y CONVERTIR CAMPOS
+// INICIO DEL PROCESAMIENTO PRINCIPAL
 // ==========================
+try {
+    // ==========================
+    // AUTENTICACIÓN GESTIONREAL
+    // ==========================
+    $fechaHoy = date("Y-m-d");
+    $usuario = $CUIT;
+    $tokenBase = $CUIT . $SECRET . $fechaHoy;
+    $contrasena = md5($tokenBase);
 
-// Obtener email y teléfono primarios
-$email = "";
-$phone = "";
+    logDebug("=== INICIANDO PROCESAMIENTO WEBHOOK ===");
+    logDebug("Procesando deal ID: " . $deal_id);
 
-if (isset($person['email'])) {
-    foreach ($person['email'] as $email_data) {
-        if (isset($email_data['primary']) && $email_data['primary']) {
-            $email = $email_data['value'];
-            break;
+    // ==========================
+    // OBTENER DATOS DEL DEAL
+    // ==========================
+    $deal_data = callPipedriveAPI("deals/{$deal_id}", $PIPEDRIVE_API_KEY);
+
+    if (!$deal_data || !isset($deal_data['data'])) {
+        $errorMsg = "Error al obtener datos del deal de Pipedrive";
+        logDebug("ERROR: " . $errorMsg);
+        sendTelegramMessage($TELEGRAM_BOT_TOKEN, $TELEGRAM_CHAT_IDS, 
+            formatErrorMessage("Desconocido", "Desconocido", $errorMsg), 'error', $deal_id
+        );
+        exit;
+    }
+
+    $deal = $deal_data['data'];
+    $person_id = $deal['person_id']['value'] ?? null;
+
+    if (empty($person_id)) {
+        $errorMsg = "El deal no tiene una persona asociada";
+        logDebug("ERROR: " . $errorMsg);
+        sendTelegramMessage($TELEGRAM_BOT_TOKEN, $TELEGRAM_CHAT_IDS, 
+            formatErrorMessage("Desconocido", "Desconocido", $errorMsg), 'error', $deal_id
+        );
+        exit;
+    }
+
+    logDebug("Person ID asociado: " . $person_id);
+
+    // ==========================
+    // OBTENER DATOS DE LA PERSONA
+    // ==========================
+    $person_data = callPipedriveAPI("persons/{$person_id}", $PIPEDRIVE_API_KEY);
+
+    if (!$person_data || !isset($person_data['data'])) {
+        $errorMsg = "Error al obtener datos de la persona de Pipedrive";
+        logDebug("ERROR: " . $errorMsg);
+        sendTelegramMessage($TELEGRAM_BOT_TOKEN, $TELEGRAM_CHAT_IDS, 
+            formatErrorMessage("Desconocido", "Desconocido", $errorMsg), 'error', $deal_id
+        );
+        exit;
+    }
+
+    $person = $person_data['data'];
+    logDebug("Persona obtenida: " . $person['name']);
+
+    // ==========================
+    // EXTRAER Y CONVERTIR CAMPOS - CON MEJOR LOGGING
+    // ==========================
+    
+    // Obtener email y teléfono primarios
+    $email = "";
+    $phone = "";
+
+    if (isset($person['email'])) {
+        foreach ($person['email'] as $email_data) {
+            if (isset($email_data['primary']) && $email_data['primary']) {
+                $email = $email_data['value'];
+                break;
+            }
+        }
+        if (empty($email) && count($person['email']) > 0) {
+            $email = $person['email'][0]['value'];
         }
     }
-    // Si no hay email primario, tomar el primero
-    if (empty($email) && count($person['email']) > 0) {
-        $email = $person['email'][0]['value'];
-    }
-}
 
-if (isset($person['phone'])) {
-    foreach ($person['phone'] as $phone_data) {
-        if (isset($phone_data['primary']) && $phone_data['primary']) {
-            $phone = $phone_data['value'];
-            break;
+    if (isset($person['phone'])) {
+        foreach ($person['phone'] as $phone_data) {
+            if (isset($phone_data['primary']) && $phone_data['primary']) {
+                $phone = $phone_data['value'];
+                break;
+            }
+        }
+        if (empty($phone) && count($person['phone']) > 0) {
+            $phone = $person['phone'][0]['value'];
         }
     }
-    // Si no hay teléfono primario, tomar el primero
-    if (empty($phone) && count($person['phone']) > 0) {
-        $phone = $person['phone'][0]['value'];
+
+    // Obtener valores de campos personalizados CON MEJOR LOGGING
+    $tipoDoc = getCustomFieldValue($person, "3cbc0ce6d5f8273c424e15326f7abf98db778999");
+    $tipoDocId = isset($tipoDocumentoMap[$tipoDoc]) ? $tipoDocumentoMap[$tipoDoc] : 99;
+    logDebug("Tipo Documento: $tipoDoc -> $tipoDocId");
+
+    $numerodocumento = getCustomFieldValue($person, "12714bada69427c8e30467f7b25bd772de7b62a1");
+    logDebug("Número Documento: $numerodocumento");
+
+    $tipoIva = getCustomFieldValue($person, "8109e9738547e3edcfd058044f2cca05f6025ab4");
+    $tipoIvaId = isset($tipoIvaMap[$tipoIva]) ? $tipoIvaMap[$tipoIva] : "CF";
+    logDebug("Tipo IVA: $tipoIva -> $tipoIvaId");
+
+    $domicilio = getCustomFieldValue($person, "3c7c18ea2955877438bef2681ed3f4cf4e063b90");
+    $cp = getCustomFieldValue($person, "297583b2c3c17ae86a7162a462951f897af51bb0");
+
+    $localidad = getCustomFieldValue($person, "3682d5b70313c7eb42dce3b091c64874d0a1df59");
+    $localidadId = isset($localidadMap[$localidad]) ? $localidadMap[$localidad] : null;
+    logDebug("Localidad: $localidad -> $localidadId");
+
+    $pais = getCustomFieldValue($person, "d9c9dc0603c35de9c24cb6539e1437d92d1fbb81");
+    $paisId = isset($paisMap[$pais]) ? $paisMap[$pais] : 200;
+
+    $provincia = getCustomFieldValue($person, "7b10eb8681187ea7dc2e23d166a2b1f74a8447ec");
+    $provinciaId = isset($provinciaMap[$provincia]) ? $provinciaMap[$provincia] : null;
+    logDebug("Provincia: $provincia -> $provinciaId");
+
+    $cond_vta = getCustomFieldValue($person, "6a47adb804e8a091cc23ff7ba57fe118267d2b5b");
+    $cond_vta_value = isset($condVentaMap[$cond_vta]) ? $condVentaMap[$cond_vta] : "Cuenta Corriente";
+
+    $estado = getCustomFieldValue($person, "3fb2514f06716411a71637108b5a87747ed62fd4");
+    $estadoId = isset($estadoMap[$estado]) ? $estadoMap[$estado] : 1;
+
+    $sucursal = getCustomFieldValue($person, "8bbde979a06ec5e5ff2693d8aa031f8e2d3c02fb");
+    $sucursalId = isset($sucursalMap[$sucursal]) ? $sucursalMap[$sucursal] : null;
+    logDebug("Sucursal: $sucursal -> $sucursalId");
+
+    $corporativo = getCustomFieldValue($person, "7b08431508bc040e5ef9f613774e5417ded99f52");
+    $corporativoId = isset($corporativoMap[$corporativo]) ? $corporativoMap[$corporativo] : 0;
+
+    $lat = getCustomFieldValue($person, "9d65ac2fbaaf3551c7f76713178c19da32ff11fb");
+    $lng = getCustomFieldValue($person, "5097081f14f29eb616e9d1777200e5e826bea5b6");
+
+    $cartera = getCustomFieldValue($person, "ed8591757da3a43d8a96b47b3401b817da81fb99");
+    $carteraId = isset($carteraMap[$cartera]) ? $carteraMap[$cartera] : null;
+    logDebug("Cartera: $cartera -> $carteraId");
+
+    $modelo = getCustomFieldValue($person, "37739fb39702a2d83af6cf3afed8807805046dc1");
+    $modeloId = isset($modeloMap[$modelo]) ? $modeloMap[$modelo] : null;
+    logDebug("Modelo: $modelo -> $modeloId");
+
+    // Obtener barrio
+    $barrio = getCustomFieldValue($person, "cedb1c0c169a0232c4a832a2d0acd62361f156a8");
+    $barrioId = isset($barrioMap[$barrio]) ? $barrioMap[$barrio] : null;
+    
+    // DEBUG: Mostrar todos los campos personalizados disponibles
+    logDebug("Todos los campos personalizados de la persona:");
+    if (isset($person['custom_fields'])) {
+        foreach ($person['custom_fields'] as $field) {
+            if (isset($field['key']) && isset($field['value'])) {
+                logDebug("Campo: " . $field['key'] . " = " . $field['value']);
+            }
+        }
     }
-}
 
-// Obtener valores de campos personalizados
-$tipoDoc = getCustomFieldValue($person, "3cbc0ce6d5f8273c424e15326f7abf98db778999");
-$tipoDocId = isset($tipoDocumentoMap[$tipoDoc]) ? $tipoDocumentoMap[$tipoDoc] : 99;
+    // Validar campos obligatorios
+    $camposObligatorios = [
+        'nombre' => $person['name'] ?? '',
+        'numerodocumento' => $numerodocumento,
+        'mail' => $email
+    ];
 
-$numerodocumento = getCustomFieldValue($person, "12714bada69427c8e30467f7b25bd772de7b62a1");
-
-$tipoIva = getCustomFieldValue($person, "8109e9738547e3edcfd058044f2cca05f6025ab4");
-$tipoIvaId = isset($tipoIvaMap[$tipoIva]) ? $tipoIvaMap[$tipoIva] : "CF";
-
-$domicilio = getCustomFieldValue($person, "3c7c18ea2955877438bef2681ed3f4cf4e063b90");
-$cp = getCustomFieldValue($person, "297583b2c3c17ae86a7162a462951f897af51bb0");
-
-$localidad = getCustomFieldValue($person, "3682d5b70313c7eb42dce3b091c64874d0a1df59");
-$localidadId = isset($localidadMap[$localidad]) ? $localidadMap[$localidad] : null;
-
-$pais = getCustomFieldValue($person, "d9c9dc0603c35de9c24cb6539e1437d92d1fbb81");
-$paisId = isset($paisMap[$pais]) ? $paisMap[$pais] : 200;
-
-$provincia = getCustomFieldValue($person, "7b10eb8681187ea7dc2e23d166a2b1f74a8447ec");
-$provinciaId = isset($provinciaMap[$provincia]) ? $provinciaMap[$provincia] : null;
-
-$cond_vta = getCustomFieldValue($person, "6a47adb804e8a091cc23ff7ba57fe118267d2b5b");
-$cond_vta_value = isset($condVentaMap[$cond_vta]) ? $condVentaMap[$cond_vta] : "Cuenta Corriente";
-
-$estado = getCustomFieldValue($person, "3fb2514f06716411a71637108b5a87747ed62fd4");
-$estadoId = isset($estadoMap[$estado]) ? $estadoMap[$estado] : 1;
-
-$sucursal = getCustomFieldValue($person, "8bbde979a06ec5e5ff2693d8aa031f8e2d3c02fb");
-$sucursalId = isset($sucursalMap[$sucursal]) ? $sucursalMap[$sucursal] : null;
-
-$corporativo = getCustomFieldValue($person, "7b08431508bc040e5ef9f613774e5417ded99f52");
-$corporativoId = isset($corporativoMap[$corporativo]) ? $corporativoMap[$corporativo] : 0;
-
-$lat = getCustomFieldValue($person, "9d65ac2fbaaf3551c7f76713178c19da32ff11fb");
-$lng = getCustomFieldValue($person, "5097081f14f29eb616e9d1777200e5e826bea5b6");
-
-$cartera = getCustomFieldValue($person, "ed8591757da3a43d8a96b47b3401b817da81fb99");
-$carteraId = isset($carteraMap[$cartera]) ? $carteraMap[$cartera] : null;
-
-$modelo = getCustomFieldValue($person, "37739fb39702a2d83af6cf3afed8807805046dc1");
-$modeloId = isset($modeloMap[$modelo]) ? $modeloMap[$modelo] : null;
-
-// Log de campos obtenidos
-logDebug("Campos extraídos - Email: $email, Tel: $phone, TipoDoc: $tipoDocId, NroDoc: $numerodocumento");
-
-// ==========================
-// VALIDAR CAMPOS OBLIGATORIOS
-// ==========================
-$camposObligatorios = [
-    'nombre' => $person['name'] ?? '',
-    'numerodocumento' => $numerodocumento,
-    'mail' => $email
-];
-
-$camposFaltantes = [];
-foreach ($camposObligatorios as $campo => $valor) {
-    if (empty($valor)) {
-        $camposFaltantes[] = $campo;
+    $camposFaltantes = [];
+    foreach ($camposObligatorios as $campo => $valor) {
+        if (empty($valor)) {
+            $camposFaltantes[] = $campo;
+        }
     }
-}
 
-if (!empty($camposFaltantes)) {
-    http_response_code(400);
-    echo json_encode([
-        "error" => "Campos obligatorios faltantes: " . implode(", ", $camposFaltantes),
-        "person_data" => $person
-    ]);
-    logDebug("ERROR: Campos obligatorios faltantes: " . implode(", ", $camposFaltantes));
-    exit;
-}
-
-// ==========================
-// PREPARAR DATOS PARA GESTIONREAL
-// ==========================
-$payload = [
-    "action"            => "new_cliente",
-    "nombre"            => $person['name'] ?? "",
-    "tipodocumento"     => $tipoDocId,
-    "numerodocumento"   => $numerodocumento,
-    "tipo_iva"          => $tipoIvaId,
-    "domicilio"         => $domicilio ?? "",
-    "cp"                => $cp ?? "",
-    "localidad"         => $localidadId,
-    "pais"              => $paisId,
-    "provincia"         => $provinciaId ?? "",
-    "mail"              => $email,
-    "telefonos"         => $phone,
-    "cond_vta"          => $cond_vta_value,
-    "estado"            => $estadoId,
-    "sucursal"          => $sucursalId,
-    "corporativo"       => $corporativoId,
-    "lat"               => $lat ?? "",
-    "lng"               => $lng ?? "",
-    "cartera"           => $carteraId,
-    "modelo"            => $modeloId
-];
-
-// Limpiar payload de valores nulos
-foreach ($payload as $key => $value) {
-    if ($value === null) {
-        $payload[$key] = "";
+    if (!empty($camposFaltantes)) {
+        $errorMsg = "Campos obligatorios faltantes: " . implode(", ", $camposFaltantes);
+        logDebug("ERROR: " . $errorMsg);
+        sendTelegramMessage($TELEGRAM_BOT_TOKEN, $TELEGRAM_CHAT_IDS, 
+            formatErrorMessage($person['name'] ?? "Desconocido", $numerodocumento ?? "Desconocido", $errorMsg), 'error', $deal_id
+        );
+        exit;
     }
-}
 
-logDebug("Payload para GestionReal: " . json_encode($payload));
+    // ==========================
+    // PREPARAR DATOS PARA GESTIONREAL - CON BARRIO
+    // ==========================
+    $payload = [
+        "action"            => "new_cliente",
+        "nombre"            => $person['name'] ?? "",
+        "tipodocumento"     => $tipoDocId,
+        "numerodocumento"   => $numerodocumento,
+        "tipo_iva"          => $tipoIvaId,
+        "domicilio"         => $domicilio ?? "",
+        "cp"                => $cp ?? "",
+        "localidad"         => $localidadId,
+        "pais"              => $paisId,
+        "provincia"         => $provinciaId ?? "",
+        "mail"              => $email,
+        "telefonos"         => $phone,
+        "cond_vta"          => $cond_vta_value,
+        "estado"            => $estadoId,
+        "sucursal"          => $sucursalId,
+        "corporativo"       => $corporativoId,
+        "lat"               => $lat ?? "",
+        "lng"               => $lng ?? "",
+        "cartera"           => $carteraId,
+        "modelo"            => $modeloId,
+        "barrio"            => $barrioId
+    ];
 
-// ==========================
-// ENVIAR A API DE GESTIONREAL
-// ==========================
-$url = "https://api.gestionreal.com.ar/";
+    // Limpiar payload de valores nulos
+    foreach ($payload as $key => $value) {
+        if ($value === null) {
+            $payload[$key] = "";
+        }
+    }
 
-$ch = curl_init($url);
-curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-curl_setopt($ch, CURLOPT_USERPWD, "$usuario:$contrasena");
-curl_setopt($ch, CURLOPT_POST, true);
-curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload)); // <-- JSON
-curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-curl_setopt($ch, CURLOPT_HTTPHEADER, [
-    'Content-Type: application/json' // <-- JSON
-]);
+    logDebug("Payload completo para GestionReal: " . json_encode($payload));
 
-
-logDebug("Enviando solicitud a GestionReal...");
-
-$response = curl_exec($ch);
-$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-$error = curl_error($ch);
-curl_close($ch);
-
-logDebug("Respuesta de GestionReal - HTTP Code: $httpCode");
-logDebug("Response: " . $response);
-
-if ($error) {
-    logDebug("Error cURL: " . $error);
-}
-
-// ==========================
-// RESPUESTA
-// ==========================
-header("Content-Type: application/json");
-
-if ($httpCode == 200) {
-    $responseData = json_decode($response, true);
     $clienteNombre = trim($payload['nombre']);
-
-    logDebug("Cliente creado en GestionReal: $clienteNombre. Esperando 5 segundos antes de buscarlo...");
-    sleep(5); // Delay de 5 segundos
+    $clienteDocumento = $payload['numerodocumento'];
+    $url = "https://api.gestionreal.com.ar/";
 
     // ==========================
-    // CONSULTAR CLIENTE RECIÉN CREADO EN GESTIONREAL
+    // VERIFICAR SI EL CLIENTE YA EXISTE
     // ==========================
+    logDebug("=== VERIFICANDO SI CLIENTE YA EXISTE EN GESTIONREAL ===");
+
     $buscarPayload = [
         "action"         => "cliente",
         "tipo_documento" => $tipoDocId,
         "nro_documento"  => $numerodocumento
     ];
 
-    $ch = curl_init($url);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-    curl_setopt($ch, CURLOPT_USERPWD, "$usuario:$contrasena");
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($buscarPayload));
-    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+    $buscarResult = callGestionRealAPI($url, $usuario, $contrasena, $buscarPayload, "search");
+    $httpCodeBuscar = $buscarResult['http_code'];
+    $buscarResponse = $buscarResult['response'];
 
-    logDebug("Buscando cliente en GestionReal por tipo_documento + nro_documento...");
-    $buscarResponse = curl_exec($ch);
-    $httpCodeBuscar = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $errorBuscar = curl_error($ch);
-    curl_close($ch);
+    logDebug("Respuesta de búsqueda - HTTP Code: $httpCodeBuscar");
 
-    logDebug("Respuesta de búsqueda - HTTP Code: $httpCodeBuscar, Response: $buscarResponse");
+    $clienteExistente = false;
+    $clienteId = null;
 
     if ($httpCodeBuscar == 200) {
-        $clienteData = json_decode($buscarResponse, true);
+        $clienteData = $buscarResult['data'];
         if (isset($clienteData['clientes'][0]['idcustomer'])) {
-    $cliente_id = $clienteData['clientes'][0]['idcustomer'];
-    logDebug("Cliente encontrado con ID: $cliente_id");
-
-            // ==========================
-            // CREAR CASO EN GESTIONREAL
-            // ==========================
-            $descripcionCaso = base64_encode("Caso generado por Pipedrive para el cliente $clienteNombre");
-
-            $casoPayload = [
-                "action"      => "genera_reclamo",
-                "cliente_id"  => $cliente_id,
-                "creado_por"  => "Web",
-                "via"         => "Interno",
-                "descripcion" => $descripcionCaso,
-                "tipo_caso_id" => 2,  // fijo
-                "grupo_id"     => 369  // fijo
-            ];
-
-            $ch = curl_init($url);
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-            curl_setopt($ch, CURLOPT_USERPWD, "$usuario:$contrasena");
-            curl_setopt($ch, CURLOPT_POST, true);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($casoPayload));
-            curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-            curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
-
-            logDebug("Creando caso para el cliente $clienteNombre...");
-            $casoResponse = curl_exec($ch);
-            $httpCodeCaso = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $errorCaso = curl_error($ch);
-            curl_close($ch);
-
-            logDebug("Respuesta de creación de caso - HTTP Code: $httpCodeCaso, Response: $casoResponse");
-
+            $clienteId = $clienteData['clientes'][0]['idcustomer'];
+            $clienteExistente = true;
+            logDebug("✅ Cliente ya existe en GestionReal con ID: $clienteId");
         } else {
-            logDebug("❌ No se encontró el cliente en GestionReal después de crear el perfil");
+            logDebug("ℹ️ Cliente no encontrado en GestionReal, procediendo a crearlo...");
         }
     } else {
-        logDebug("❌ Error al buscar cliente en GestionReal: $errorBuscar");
+        logDebug("⚠️ Error al buscar cliente, procediendo con creación...");
     }
 
-    echo json_encode([
-        "status"    => "success",
-        "http_code" => $httpCode,
-        "request"   => $payload,
-        "response"  => $responseData
-    ]);
-    logDebug("✅ Solicitud exitosa a GestionReal");
+    // ==========================
+    // LÓGICA PRINCIPAL - CREAR CLIENTE O USAR EXISTENTE
+    // ==========================
+    if ($clienteExistente) {
+        // CLIENTE YA EXISTE - SOLO CREAR CASO
+        logDebug("Cliente ya existe, creando caso solamente...");
+        
+        $descripcionCaso = base64_encode("Caso generado por Pipedrive para el cliente $clienteNombre");
+
+        $casoPayload = [
+            "action"      => "genera_reclamo",
+            "cliente_id"  => $clienteId,
+            "creado_por"  => "Web",
+            "via"         => "Interno",
+            "descripcion" => $descripcionCaso,
+            "tipo_caso_id" => 46,
+            "grupo_id"     => 369,
+            "estado" => "Cerrado"
+        ];
+
+        $casoResult = callGestionRealAPI($url, $usuario, $contrasena, $casoPayload, "create_case");
+        $httpCodeCaso = $casoResult['http_code'];
+
+        logDebug("Respuesta de creación de caso - HTTP Code: $httpCodeCaso");
+
+        // Enviar mensaje SOLO si no se ha enviado uno recientemente para este deal
+        $mensajeTelegram = formatInfoMessage($clienteNombre, $clienteDocumento, $clienteId, true);
+        sendTelegramMessage($TELEGRAM_BOT_TOKEN, $TELEGRAM_CHAT_IDS, $mensajeTelegram, 'info', $deal_id);
+        
+        logDebug("✅ Proceso completado - Cliente existente, caso creado");
+
+    } else {
+        // CLIENTE NO EXISTE - CREAR CLIENTE Y LUEGO CASO
+        logDebug("Cliente no existe, procediendo a crearlo...");
+
+        $createResult = callGestionRealAPI($url, $usuario, $contrasena, $payload, "create_client");
+        $httpCode = $createResult['http_code'];
+        $createResponse = $createResult['response'];
+        $createData = $createResult['data'];
+
+        logDebug("Respuesta de GestionReal - HTTP Code: $httpCode");
+
+        if ($httpCode == 200) {
+            logDebug("Cliente creado en GestionReal: $clienteNombre. Esperando 3 segundos antes de buscarlo...");
+            sleep(3);
+
+            // CONSULTAR CLIENTE RECIÉN CREADO
+            $buscarResult = callGestionRealAPI($url, $usuario, $contrasena, $buscarPayload, "search_after_create");
+            $httpCodeBuscar = $buscarResult['http_code'];
+
+            logDebug("Respuesta de búsqueda - HTTP Code: $httpCodeBuscar");
+
+            if ($httpCodeBuscar == 200) {
+                $clienteData = $buscarResult['data'];
+                if (isset($clienteData['clientes'][0]['idcustomer'])) {
+                    $clienteId = $clienteData['clientes'][0]['idcustomer'];
+                    logDebug("✅ Cliente encontrado con ID: $clienteId");
+                    
+                    // CREAR CASO
+                    $descripcionCaso = base64_encode("Caso generado por Pipedrive para el cliente $clienteNombre");
+
+                    $casoPayload = [
+                        "action"      => "genera_reclamo",
+                        "cliente_id"  => $clienteId,
+                        "creado_por"  => "Web",
+                        "via"         => "Interno",
+                        "descripcion" => $descripcionCaso,
+                        "tipo_caso_id" => 46,
+                        "grupo_id"     => 369,
+                        "estado" => "Cerrado"
+                    ];
+
+                    $casoResult = callGestionRealAPI($url, $usuario, $contrasena, $casoPayload, "create_case");
+                    $httpCodeCaso = $casoResult['http_code'];
+
+                    logDebug("Respuesta de creación de caso - HTTP Code: $httpCodeCaso");
+
+                    // Enviar mensaje SOLO si no se ha enviado uno recientemente para este deal
+                    $mensajeTelegram = formatSuccessMessage($clienteNombre, $clienteDocumento, $clienteId, true);
+                    sendTelegramMessage($TELEGRAM_BOT_TOKEN, $TELEGRAM_CHAT_IDS, $mensajeTelegram, 'success', $deal_id);
+                    
+                    logDebug("✅ Solicitud exitosa a GestionReal - Cliente ID: $clienteId");
+                    
+                } else {
+                    logDebug("❌ No se encontró el cliente en GestionReal después de crear el perfil");
+                    $errorMsg = "El cliente no se creó correctamente en GestionReal.";
+                    
+                    $mensajeTelegram = formatErrorMessage($clienteNombre, $clienteDocumento, $errorMsg, $httpCode, $createResponse);
+                    sendTelegramMessage($TELEGRAM_BOT_TOKEN, $TELEGRAM_CHAT_IDS, $mensajeTelegram, 'error', $deal_id);
+                }
+            } else {
+                $errorMsg = "Error al buscar cliente en GestionReal después de la creación";
+                logDebug("❌ " . $errorMsg);
+                
+                $mensajeTelegram = formatErrorMessage($clienteNombre, $clienteDocumento, $errorMsg, $httpCodeBuscar, $buscarResult['response']);
+                sendTelegramMessage($TELEGRAM_BOT_TOKEN, $TELEGRAM_CHAT_IDS, $mensajeTelegram, 'error', $deal_id);
+            }
+
+        } else {
+            $errorDescripcion = "Error HTTP: $httpCode al crear cliente en GestionReal";
+            
+            // CAPTURAR LA RESPUESTA REAL DE GESTIONREAL
+            $gestionRealError = $createResponse;
+            if ($createData && is_array($createData)) {
+                $gestionRealError = json_encode($createData, JSON_PRETTY_PRINT);
+            }
+            
+            logDebug("❌ Error en solicitud a GestionReal: " . $errorDescripcion);
+            logDebug("❌ Respuesta completa de GestionReal: " . $gestionRealError);
+            
+            $mensajeTelegram = formatErrorMessage($clienteNombre, $clienteDocumento, $errorDescripcion, $httpCode, $gestionRealError);
+            sendTelegramMessage($TELEGRAM_BOT_TOKEN, $TELEGRAM_CHAT_IDS, $mensajeTelegram, 'error', $deal_id);
+        }
+    }
+
+    logDebug("=== PROCESAMIENTO WEBHOOK COMPLETADO ===");
+
+} catch (Exception $e) {
+    logDebug("❌ EXCEPCIÓN NO MANEJADA: " . $e->getMessage());
+    
+    $mensajeTelegram = formatErrorMessage("Desconocido", "Desconocido", "Excepción: " . $e->getMessage(), null, null);
+    sendTelegramMessage($TELEGRAM_BOT_TOKEN, $TELEGRAM_CHAT_IDS, $mensajeTelegram, 'error', $deal_id ?? 'unknown');
+} finally {
+    // ==========================
+    // LIBERAR LOCKS SIEMPRE
+    // ==========================
+    if ($lockHandle) {
+        flock($lockHandle, LOCK_UN);
+        fclose($lockHandle);
+    }
+    
+    // Liberar lock específico del deal
+    if ($dealLockHandle) {
+        flock($dealLockHandle, LOCK_UN);
+        fclose($dealLockHandle);
+        // Opcional: eliminar archivo de lock
+        if (file_exists($dealLockFile)) {
+            unlink($dealLockFile);
+        }
+    }
 }
-
 ?>
-
